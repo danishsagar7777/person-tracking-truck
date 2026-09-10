@@ -1,0 +1,58 @@
+cat > .gitignore <<'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Model files
+*.pt
+*.onnx
+*.xml
+*.bin
+*.engine
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Local datasets / generated data
+data/input/
+data/processed/
+data/output/
+data/calibration/
+data/validation/
+
+# Generated videos
+results/videos/
+
+# Generated screenshots
+results/screenshots/
+
+# Generated machine-readable metrics
+results/metrics/*.json
+results/metrics/*.csv
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+
+# Git recovery backups
+.git_backup_before_repair/
+.git_corrupted/
+EOF

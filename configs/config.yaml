@@ -1,0 +1,26 @@
+project:
+  name: "person-tracking-truck"
+  description: "Person detection and tracking from a moving truck camera"
+
+video:
+  input: "data/input/truck_video.mp4"
+  output_detection: "results/videos/person_detection.mp4"
+  output_tracking: "results/videos/person_tracking.mp4"
+
+model:
+  name: "yolo26n.pt"
+  imgsz: 640
+  confidence: 0.25
+  iou: 0.45
+  person_class_id: 0
+
+processing:
+  save_video: true
+  display: false
+  frame_stride: 1
+
+tracking:
+  tracker: "botsort.yaml"
+
+benchmark:
+  warmup_frames: 30
