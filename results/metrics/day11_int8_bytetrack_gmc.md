@@ -22,11 +22,11 @@
 - Average track length: 85.00 frames
 - Shortest track: 85 frames
 - Longest track: 85 frames
-- Average INT8 inference: 17.03 ms
-- Average frame time: 34.32 ms
-- Processing FPS: 29.14
+- Average INT8 inference: 17.19 ms
+- Average frame time: 34.74 ms
+- Processing FPS: 28.79
 - Average ORB inliers: 256.91
 - Minimum ORB inliers: 0
 - Maximum ORB inliers: 374
-- Wall time: 36.17 sec
+- Wall time: 36.62 sec
 - Output video: `results/videos/person_tracking_int8_bytetrack_gmc.mp4`
