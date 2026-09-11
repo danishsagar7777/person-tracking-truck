@@ -1,0 +1,30 @@
+project:
+  name: person-tracking-truck
+  version: "1.0"
+
+source:
+  type: video
+  path: data/input/truck_video.mp4
+
+detector:
+  type: openvino_int8
+  model: models/yolo26n_int8/yolo26n_int8.xml
+  device: CPU
+  image_size: 640
+  confidence: 0.25
+  iou: 0.45
+  person_class: 0
+
+tracker:
+  type: bytetrack
+
+camera_motion:
+  enabled: true
+  method: ORB
+
+output:
+  video: results/videos/final_person_tracking.mp4
+  metrics: results/metrics/day15_final_pipeline.md
+
+runtime:
+  max_frames: null
