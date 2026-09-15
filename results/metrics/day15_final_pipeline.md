@@ -32,9 +32,9 @@ The video frame itself is not warped before detection.
 | Tracked detections | 305 |
 | Unique track IDs | 4 |
 | Average persons/frame | 0.663 |
-| Average inference | 17.61 ms |
-| Average frame time | 34.60 ms |
-| Processing FPS | 28.90 |
+| Average inference | 17.50 ms |
+| Average frame time | 34.55 ms |
+| Processing FPS | 28.94 |
 | Average track length | 76.25 frames |
 | Shortest track | 30 frames |
 | Longest track | 118 frames |
