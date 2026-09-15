@@ -14,15 +14,10 @@ from src.tracking.motion_compensation import CameraMotionEstimator
 
 
 # ============================================================
-# BYTE TRACK CONFIGURATION
+# BYTE TRACK ARGUMENTS
 # ============================================================
 
 class TrackerArgs:
-    """
-    Configuration required by the installed Ultralytics
-    BYTETracker implementation.
-    """
-
     def __init__(self):
         self.track_high_thresh = 0.5
         self.track_low_thresh = 0.1
@@ -31,6 +26,7 @@ class TrackerArgs:
         self.match_thresh = 0.8
         self.fuse_score = True
 
+        # ReID disabled because this project uses ByteTrack.
         self.with_reid = False
         self.proximity_thresh = 0.5
         self.appearance_thresh = 0.25
@@ -40,7 +36,7 @@ class TrackerArgs:
 # CONFIG
 # ============================================================
 
-def load_config(path: str) -> dict:
+def load_config(path):
     with open(path, "r", encoding="utf-8") as file:
         return yaml.safe_load(file)
 
@@ -51,15 +47,12 @@ def load_config(path: str) -> dict:
 
 def detections_to_boxes(detections, frame_shape):
     """
-    Convert detector detections into an Ultralytics Boxes object.
+    Convert our detector dictionaries into the Boxes object
+    expected by the current Ultralytics BYTETracker API.
 
-    Expected detection format:
+    Each row:
 
-        {
-            "bbox": [x1, y1, x2, y2],
-            "confidence": float,
-            "class_id": int
-        }
+        x1, y1, x2, y2, confidence, class_id
     """
 
     height, width = frame_shape[:2]
@@ -67,17 +60,32 @@ def detections_to_boxes(detections, frame_shape):
     rows = []
 
     for detection in detections:
-        x1, y1, x2, y2 = detection["bbox"]
+        bbox = detection.get("bbox")
+
+        if bbox is None or len(bbox) != 4:
+            continue
+
+        x1, y1, x2, y2 = bbox
 
         confidence = float(
-            detection["confidence"]
+            detection.get(
+                "confidence",
+                detection.get("conf", detection.get("score", 0.0)),
+            )
         )
 
-        class_id = float(
-            detection["class_id"]
+        class_id = int(
+            detection.get(
+                "class_id",
+                detection.get("cls", 0),
+            )
         )
 
-        # Clamp coordinates to image bounds.
+        # Person-only pipeline.
+        if class_id != 0:
+            continue
+
+        # Clamp coordinates.
         x1 = max(0.0, min(float(x1), width - 1))
         y1 = max(0.0, min(float(y1), height - 1))
         x2 = max(0.0, min(float(x2), width - 1))
@@ -93,20 +101,14 @@ def detections_to_boxes(detections, frame_shape):
                 x2,
                 y2,
                 confidence,
-                class_id,
+                float(class_id),
             ]
         )
 
     if not rows:
-        data = np.empty(
-            (0, 6),
-            dtype=np.float32,
-        )
+        data = np.empty((0, 6), dtype=np.float32)
     else:
-        data = np.asarray(
-            rows,
-            dtype=np.float32,
-        )
+        data = np.asarray(rows, dtype=np.float32)
 
     return Boxes(
         data,
@@ -118,124 +120,66 @@ def detections_to_boxes(detections, frame_shape):
 # AFFINE TRANSFORM HELPERS
 # ============================================================
 
-def affine_to_homogeneous(matrix):
-    """
-    Convert a 2x3 affine matrix to a 3x3 homogeneous matrix.
-
-    CameraMotionEstimator returns:
-
-        transform, inlier_count
-
-    or an affine matrix depending on implementation.
-    """
-
-    if isinstance(matrix, (tuple, list)):
-        matrix = matrix[0]
-
-    matrix = np.asarray(
-        matrix,
-        dtype=np.float32,
-    )
-
-    if matrix.shape != (2, 3):
-        return np.eye(
-            3,
-            dtype=np.float32,
-        )
-
-    result = np.eye(
-        3,
-        dtype=np.float32,
-    )
-
-    result[:2, :] = matrix
-
-    return result
+def affine_to_homogeneous(transform):
+    matrix = np.eye(3, dtype=np.float32)
+    matrix[:2, :] = np.asarray(transform, dtype=np.float32)
+    return matrix
 
 
 def transform_bbox(
     bbox,
     transform,
-    width,
-    height,
+    frame_width,
+    frame_height,
 ):
     """
-    Transform a bounding box using a 3x3 transformation matrix.
+    Transform all four bbox corners using a 2x3 affine matrix.
     """
 
     x1, y1, x2, y2 = bbox
 
     points = np.array(
         [
-            [x1, y1, 1.0],
-            [x2, y1, 1.0],
-            [x2, y2, 1.0],
-            [x1, y2, 1.0],
+            [x1, y1],
+            [x2, y1],
+            [x2, y2],
+            [x1, y2],
         ],
         dtype=np.float32,
     )
 
-    transformed = (
-        transform @ points.T
-    ).T
+    matrix = affine_to_homogeneous(transform)
 
-    denominator = np.maximum(
-        transformed[:, 2:3],
-        1e-6,
+    homogeneous = np.concatenate(
+        [
+            points,
+            np.ones((4, 1), dtype=np.float32),
+        ],
+        axis=1,
     )
 
-    transformed = (
-        transformed[:, :2]
-        / denominator
-    )
+    transformed = homogeneous @ matrix.T
 
-    new_x1 = float(
-        np.min(transformed[:, 0])
-    )
+    new_x1 = float(np.min(transformed[:, 0]))
+    new_y1 = float(np.min(transformed[:, 1]))
+    new_x2 = float(np.max(transformed[:, 0]))
+    new_y2 = float(np.max(transformed[:, 1]))
 
-    new_y1 = float(
-        np.min(transformed[:, 1])
-    )
+    new_x1 = max(0.0, min(new_x1, frame_width - 1))
+    new_y1 = max(0.0, min(new_y1, frame_height - 1))
+    new_x2 = max(0.0, min(new_x2, frame_width - 1))
+    new_y2 = max(0.0, min(new_y2, frame_height - 1))
 
-    new_x2 = float(
-        np.max(transformed[:, 0])
-    )
-
-    new_y2 = float(
-        np.max(transformed[:, 1])
-    )
-
-    new_x1 = max(
-        0.0,
-        min(new_x1, width - 1),
-    )
-
-    new_y1 = max(
-        0.0,
-        min(new_y1, height - 1),
-    )
-
-    new_x2 = max(
-        0.0,
-        min(new_x2, width - 1),
-    )
-
-    new_y2 = max(
-        0.0,
-        min(new_y2, height - 1),
-    )
+    if new_x2 <= new_x1 or new_y2 <= new_y1:
+        return None
 
     return (
-        float(new_x1),
-        float(new_y1),
-        float(new_x2),
-        float(new_y2),
+        new_x1,
+        new_y1,
+        new_x2,
+        new_y2,
     )
 
-
-# ============================================================
-# GMC TRANSFORM FOR DETECTIONS
-# ============================================================
 
 def transform_detections(
     detections,
@@ -243,16 +187,12 @@ def transform_detections(
     frame_shape,
 ):
     """
-    Transform detector bounding boxes into the GMC reference
-    coordinate system.
+    Transform detection boxes only.
 
-    IMPORTANT:
+    Important:
+    We do NOT warp the video frame before YOLO inference.
 
-    We transform only the bounding boxes.
-
-    We DO NOT warp the image.
-
-    YOLO therefore always receives the original frame.
+    The detector always sees the original camera image.
     """
 
     height, width = frame_shape[:2]
@@ -260,28 +200,28 @@ def transform_detections(
     transformed_detections = []
 
     for detection in detections:
+        bbox = detection.get("bbox")
 
-        bbox = transform_bbox(
-            detection["bbox"],
+        if bbox is None:
+            continue
+
+        new_bbox = transform_bbox(
+            bbox,
             transform,
             width,
             height,
         )
 
-        x1, y1, x2, y2 = bbox
-
-        if x2 <= x1 or y2 <= y1:
+        if new_bbox is None:
             continue
 
-        transformed_detection = dict(
-            detection
-        )
+        transformed_detection = dict(detection)
 
         transformed_detection["bbox"] = [
-            x1,
-            y1,
-            x2,
-            y2,
+            int(round(new_bbox[0])),
+            int(round(new_bbox[1])),
+            int(round(new_bbox[2])),
+            int(round(new_bbox[3])),
         ]
 
         transformed_detections.append(
@@ -292,81 +232,7 @@ def transform_detections(
 
 
 # ============================================================
-# TRACK DRAWING
-# ============================================================
-
-def draw_tracks(
-    frame,
-    tracks,
-    inverse_transform,
-):
-    """
-    Convert tracker/reference coordinates back into original
-    image coordinates and draw the tracked persons.
-    """
-
-    height, width = frame.shape[:2]
-
-    if tracks is None:
-        return frame
-
-    for track in tracks:
-
-        if len(track) < 5:
-            continue
-
-        x1, y1, x2, y2 = track[:4]
-
-        track_id = int(
-            track[4]
-        )
-
-        bbox = transform_bbox(
-            (
-                x1,
-                y1,
-                x2,
-                y2,
-            ),
-            inverse_transform,
-            width,
-            height,
-        )
-
-        x1, y1, x2, y2 = bbox
-
-        x1 = int(x1)
-        y1 = int(y1)
-        x2 = int(x2)
-        y2 = int(y2)
-
-        cv2.rectangle(
-            frame,
-            (x1, y1),
-            (x2, y2),
-            (255, 255, 255),
-            2,
-        )
-
-        cv2.putText(
-            frame,
-            f"Person ID: {track_id}",
-            (
-                x1,
-                max(20, y1 - 8),
-            ),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    return frame
-
-
-# ============================================================
-# GMC SANITY CHECK
+# GMC VALIDATION
 # ============================================================
 
 def valid_camera_transform(
@@ -374,13 +240,7 @@ def valid_camera_transform(
     inlier_count,
 ):
     """
-    Reject obviously unstable ORB/GMC transforms.
-
-    A moving truck camera should normally produce a reasonable
-    frame-to-frame affine transform.
-
-    If the estimated transform is obviously unstable, use
-    identity for that frame instead of damaging tracking.
+    Reject unstable ORB camera-motion estimates.
     """
 
     if inlier_count < 10:
@@ -392,6 +252,9 @@ def valid_camera_transform(
     )
 
     if matrix.shape != (2, 3):
+        return False
+
+    if not np.all(np.isfinite(matrix)):
         return False
 
     linear = matrix[:, :2]
@@ -428,13 +291,74 @@ def valid_camera_transform(
 
 
 # ============================================================
+# TRACK DRAWING
+# ============================================================
+
+def draw_tracks(
+    frame,
+    tracks,
+):
+    """
+    Draw ByteTrack results directly in the original frame
+    coordinate system.
+    """
+
+    if tracks is None:
+        return frame
+
+    if len(tracks) == 0:
+        return frame
+
+    for track in tracks:
+
+        if len(track) < 5:
+            continue
+
+        x1 = int(round(float(track[0])))
+        y1 = int(round(float(track[1])))
+        x2 = int(round(float(track[2])))
+        y2 = int(round(float(track[3])))
+
+        track_id = int(track[4])
+
+        confidence = 0.0
+
+        if len(track) > 5:
+            confidence = float(track[5])
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            (255, 255, 255),
+            2,
+        )
+
+        cv2.putText(
+            frame,
+            f"Person ID: {track_id} {confidence:.2f}",
+            (
+                x1,
+                max(20, y1 - 8),
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return frame
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
 
     parser = argparse.ArgumentParser(
-        description="Final person tracking pipeline"
+        description="Final INT8 Person Tracking Pipeline"
     )
 
     parser.add_argument(
@@ -451,26 +375,22 @@ def main():
     parser.add_argument(
         "--disable-gmc",
         action="store_true",
-        help="Disable camera-motion compensation",
+        help="Disable ORB global camera-motion compensation.",
     )
 
     args = parser.parse_args()
 
     # --------------------------------------------------------
-    # LOAD CONFIG
+    # CONFIG
     # --------------------------------------------------------
 
     config = load_config(
         args.config
     )
 
-    source_path = config[
-        "source"
-    ]["path"]
+    source_path = config["source"]["path"]
 
-    model_path = config[
-        "detector"
-    ]["model"]
+    model_path = config["detector"]["model"]
 
     output_video = Path(
         config["output"]["video"]
@@ -481,9 +401,7 @@ def main():
     )
 
     configured_gmc = bool(
-        config[
-            "camera_motion"
-        ]["enabled"]
+        config["camera_motion"]["enabled"]
     )
 
     gmc_enabled = (
@@ -509,27 +427,19 @@ def main():
     print("FINAL PERSON TRACKING PIPELINE")
     print("=" * 70)
 
+    print(f"Source: {source_path}")
+    print(f"Model: {model_path}")
     print(
-        f"Source: {source_path}"
+        f"Tracker: {config['tracker']['type']}"
     )
-
-    print(
-        f"Model: {model_path}"
-    )
-
-    print(
-        f"Tracker: "
-        f"{config['tracker']['type']}"
-    )
-
-    print(
-        f"GMC enabled: "
-        f"{gmc_enabled}"
-    )
+    print(f"GMC enabled: {gmc_enabled}")
 
     if args.disable_gmc:
+        print("GMC override: DISABLED")
+
+    if args.max_frames is not None:
         print(
-            "GMC override: DISABLED"
+            f"Maximum frames: {args.max_frames}"
         )
 
     print()
@@ -538,22 +448,14 @@ def main():
     # VALIDATE FILES
     # --------------------------------------------------------
 
-    if not Path(
-        source_path
-    ).exists():
-
+    if not Path(source_path).exists():
         raise FileNotFoundError(
-            f"Input video not found: "
-            f"{source_path}"
+            f"Input video not found: {source_path}"
         )
 
-    if not Path(
-        model_path
-    ).exists():
-
+    if not Path(model_path).exists():
         raise FileNotFoundError(
-            f"INT8 model not found: "
-            f"{model_path}"
+            f"INT8 model not found: {model_path}"
         )
 
     # --------------------------------------------------------
@@ -566,39 +468,25 @@ def main():
 
     detector = INT8PersonDetector(
         model_path=model_path,
-        image_size=config[
-            "detector"
-        ]["image_size"],
-        confidence=config[
-            "detector"
-        ]["confidence"],
-        iou=config[
-            "detector"
-        ]["iou"],
-        device=config[
-            "detector"
-        ]["device"],
+        image_size=config["detector"]["image_size"],
+        confidence=config["detector"]["confidence"],
+        iou=config["detector"]["iou"],
+        device=config["detector"]["device"],
     )
 
-    print(
-        "INT8 detector loaded."
-    )
+    print("INT8 detector loaded.")
 
     # --------------------------------------------------------
     # TRACKER
     # --------------------------------------------------------
 
-    print(
-        "Creating ByteTrack..."
-    )
+    print("Creating ByteTrack...")
 
     tracker = BYTETracker(
         TrackerArgs()
     )
 
-    print(
-        "ByteTrack created."
-    )
+    print("ByteTrack created.")
 
     # --------------------------------------------------------
     # GMC
@@ -612,13 +500,9 @@ def main():
             "Creating ORB camera-motion estimator..."
         )
 
-        motion_estimator = (
-            CameraMotionEstimator()
-        )
+        motion_estimator = CameraMotionEstimator()
 
-        print(
-            "ORB GMC enabled."
-        )
+        print("ORB GMC enabled.")
 
     # --------------------------------------------------------
     # VIDEO
@@ -629,10 +513,8 @@ def main():
     )
 
     if not cap.isOpened():
-
         raise RuntimeError(
-            f"Could not open video: "
-            f"{source_path}"
+            f"Could not open video: {source_path}"
         )
 
     fps = cap.get(
@@ -654,44 +536,33 @@ def main():
         )
     )
 
-    total_source_frames = int(
+    total_frames = int(
         cap.get(
             cv2.CAP_PROP_FRAME_COUNT
         )
     )
 
     print()
-
-    print("Video information:")
     print(
-        f"  Width        : "
-        f"{frame_width}"
+        f"Video: {frame_width}x{frame_height}"
     )
-
+    print(f"FPS: {fps:.2f}")
     print(
-        f"  Height       : "
-        f"{frame_height}"
+        f"Frames: {total_frames}"
     )
-
-    print(
-        f"  FPS          : "
-        f"{fps:.2f}"
-    )
-
-    print(
-        f"  Total frames : "
-        f"{total_source_frames}"
-    )
-
     print()
 
     # --------------------------------------------------------
-    # VIDEO WRITER
+    # OUTPUT WRITER
     # --------------------------------------------------------
+
+    fourcc = cv2.VideoWriter_fourcc(
+        *"mp4v"
+    )
 
     writer = cv2.VideoWriter(
         str(output_video),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+        fourcc,
         fps,
         (
             frame_width,
@@ -700,12 +571,11 @@ def main():
     )
 
     if not writer.isOpened():
-
         cap.release()
 
         raise RuntimeError(
-            f"Could not create output "
-            f"video: {output_video}"
+            f"Could not create output video: "
+            f"{output_video}"
         )
 
     # --------------------------------------------------------
@@ -715,438 +585,385 @@ def main():
     frame_count = 0
 
     total_detections = 0
-
-    total_tracked = 0
-
-    inference_times = []
-
-    frame_times = []
+    total_tracked_detections = 0
 
     unique_ids = set()
 
-    track_lengths = {}
+    inference_times = []
+    frame_times = []
 
     gmc_valid_frames = 0
-
     gmc_invalid_frames = 0
-
     gmc_inliers = []
 
-    # --------------------------------------------------------
-    # GMC REFERENCE TRANSFORM
-    # --------------------------------------------------------
-
-    previous_to_reference = np.eye(
-        3,
-        dtype=np.float32,
-    )
-
-    total_start = time.perf_counter()
-
-    print(
-        "Processing video..."
-    )
+    start_total = time.perf_counter()
 
     # --------------------------------------------------------
-    # MAIN LOOP
+    # FRAME LOOP
     # --------------------------------------------------------
 
-    try:
+    while True:
 
-        while True:
+        if (
+            args.max_frames is not None
+            and frame_count >= args.max_frames
+        ):
+            break
 
-            if (
-                args.max_frames
-                is not None
-                and frame_count
-                >= args.max_frames
+        frame_start = time.perf_counter()
+
+        success, frame = cap.read()
+
+        if not success:
+            break
+
+        frame_count += 1
+
+        # ----------------------------------------------------
+        # 1. ESTIMATE CAMERA MOTION
+        # ----------------------------------------------------
+
+        if motion_estimator is not None:
+
+            camera_transform, inlier_count = (
+                motion_estimator.estimate(frame)
+            )
+
+            if valid_camera_transform(
+                camera_transform,
+                inlier_count,
             ):
-                break
+                gmc_valid_frames += 1
 
-            frame_start = (
-                time.perf_counter()
-            )
-
-            success, frame = cap.read()
-
-            if not success:
-                break
-
-            frame_count += 1
-
-            height, width = (
-                frame.shape[:2]
-            )
-
-            # ------------------------------------------------
-            # DEFAULT: IDENTITY TRANSFORM
-            # ------------------------------------------------
-
-            current_to_reference = np.eye(
-                3,
-                dtype=np.float32,
-            )
-
-            inlier_count = 0
-
-            # ------------------------------------------------
-            # GMC
-            #
-            # IMPORTANT:
-            # We estimate camera motion but DO NOT warp frame.
-            # YOLO always sees original frame.
-            # ------------------------------------------------
-
-            if gmc_enabled:
-
-                transform = (
-                    motion_estimator.estimate(
-                        frame
-                    )
+                gmc_inliers.append(
+                    inlier_count
                 )
 
-                affine_matrix = (
-                    transform[0]
-                    if isinstance(
-                        transform,
-                        (tuple, list),
+                # Camera estimator gives:
+                #
+                # previous -> current
+                #
+                # ByteTrack needs the current
+                # detections expressed in the
+                # previous/reference coordinate system.
+                #
+                # Therefore use inverse:
+                #
+                # current -> previous
+
+                try:
+                    compensation_transform = (
+                        cv2.invertAffineTransform(
+                            camera_transform
+                        )
                     )
-                    else transform
-                )
-
-                if frame_count > 1:
-
-                    valid = (
-                        valid_camera_transform(
-                            affine_matrix,
-                            (
-                                transform[1]
-                                if isinstance(
-                                    transform,
-                                    (tuple, list),
-                                )
-                                else 0
-                            ),
+                except cv2.error:
+                    compensation_transform = (
+                        np.eye(
+                            2,
+                            3,
+                            dtype=np.float32,
                         )
                     )
 
-                    if valid:
+            else:
+                gmc_invalid_frames += 1
 
-                        previous_to_current = (
-                            affine_to_homogeneous(
-                                transform
-                            )
-                        )
-
-                        try:
-
-                            current_to_previous = (
-                                np.linalg.inv(
-                                    previous_to_current
-                                )
-                            )
-
-                        except np.linalg.LinAlgError:
-
-                            current_to_previous = (
-                                np.eye(
-                                    3,
-                                    dtype=np.float32,
-                                )
-                            )
-
-                            valid = False
-
-                        if valid:
-
-                            current_to_reference = (
-                                previous_to_reference
-                                @ current_to_previous
-                            )
-
-                            gmc_valid_frames += 1
-
-                            inlier_count = (
-                                int(
-                                    transform[1]
-                                )
-                                if isinstance(
-                                    transform,
-                                    (tuple, list),
-                                )
-                                else 0
-                            )
-
-                            gmc_inliers.append(
-                                inlier_count
-                            )
-
-                        else:
-
-                            current_to_reference = (
-                                previous_to_reference.copy()
-                            )
-
-                            gmc_invalid_frames += 1
-
-                    else:
-
-                        current_to_reference = (
-                            previous_to_reference.copy()
-                        )
-
-                        gmc_invalid_frames += 1
-
-                previous_to_reference = (
-                    current_to_reference.copy()
-                )
-
-            # ------------------------------------------------
-            # INT8 PERSON DETECTION
-            #
-            # ALWAYS USE ORIGINAL FRAME
-            # ------------------------------------------------
-
-            inference_start = (
-                time.perf_counter()
-            )
-
-            detections = detector.detect(
-                frame
-            )
-
-            inference_ms = (
-                time.perf_counter()
-                - inference_start
-            ) * 1000.0
-
-            inference_times.append(
-                inference_ms
-            )
-
-            total_detections += (
-                len(detections)
-            )
-
-            # ------------------------------------------------
-            # TRANSFORM DETECTIONS FOR TRACKER
-            # ------------------------------------------------
-
-            tracker_detections = (
-                transform_detections(
-                    detections,
-                    current_to_reference,
-                    frame.shape,
-                )
-            )
-
-            tracker_input = (
-                detections_to_boxes(
-                    tracker_detections,
-                    frame.shape,
-                )
-            )
-
-            # ------------------------------------------------
-            # BYTE TRACK
-            # ------------------------------------------------
-
-            tracks = tracker.update(
-                tracker_input,
-                img=frame,
-            )
-
-            if tracks is None:
-                tracks = np.empty(
-                    (0, 7),
-                    dtype=np.float32,
-                )
-
-            active_tracks = len(
-                tracks
-            )
-
-            total_tracked += (
-                active_tracks
-            )
-
-            # ------------------------------------------------
-            # TRACK METRICS
-            # ------------------------------------------------
-
-            for track in tracks:
-
-                if len(track) < 5:
-                    continue
-
-                track_id = int(
-                    track[4]
-                )
-
-                unique_ids.add(
-                    track_id
-                )
-
-                track_lengths[
-                    track_id
-                ] = (
-                    track_lengths.get(
-                        track_id,
-                        0,
-                    )
-                    + 1
-                )
-
-            # ------------------------------------------------
-            # MAP TRACKS BACK TO ORIGINAL IMAGE
-            # ------------------------------------------------
-
-            try:
-
-                reference_to_current = (
-                    np.linalg.inv(
-                        current_to_reference
-                    )
-                )
-
-            except np.linalg.LinAlgError:
-
-                reference_to_current = (
+                compensation_transform = (
                     np.eye(
+                        2,
                         3,
                         dtype=np.float32,
                     )
                 )
 
-            output_frame = draw_tracks(
-                frame.copy(),
-                tracks,
-                reference_to_current,
-            )
+        else:
 
-            # ------------------------------------------------
-            # OVERLAY
-            # ------------------------------------------------
-
-            cv2.putText(
-                output_frame,
-                f"Frame: {frame_count}",
-                (20, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            cv2.putText(
-                output_frame,
-                f"Persons: {len(detections)}",
-                (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            cv2.putText(
-                output_frame,
-                f"Active tracks: {active_tracks}",
-                (20, 90),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            cv2.putText(
-                output_frame,
-                f"GMC: "
-                f"{'ON' if gmc_enabled else 'OFF'}",
-                (20, 120),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-            if gmc_enabled:
-
-                cv2.putText(
-                    output_frame,
-                    f"GMC inliers: "
-                    f"{inlier_count}",
-                    (20, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
+            compensation_transform = (
+                np.eye(
                     2,
-                    cv2.LINE_AA,
+                    3,
+                    dtype=np.float32,
                 )
-
-            # ------------------------------------------------
-            # WRITE
-            # ------------------------------------------------
-
-            writer.write(
-                output_frame
             )
 
-            # ------------------------------------------------
-            # TIMING
-            # ------------------------------------------------
+        # ----------------------------------------------------
+        # 2. INT8 YOLO ON ORIGINAL FRAME
+        # ----------------------------------------------------
 
-            frame_ms = (
+        inference_start = time.perf_counter()
+
+        detections = detector.detect(
+            frame
+        )
+
+        inference_end = time.perf_counter()
+
+        inference_ms = (
+            inference_end
+            - inference_start
+        ) * 1000.0
+
+        inference_times.append(
+            inference_ms
+        )
+
+        total_detections += len(
+            detections
+        )
+
+        # ----------------------------------------------------
+        # 3. CAMERA-MOTION COMPENSATION
+        # ----------------------------------------------------
+
+        if gmc_enabled:
+
+            tracker_detections = (
+                transform_detections(
+                    detections,
+                    compensation_transform,
+                    frame.shape,
+                )
+            )
+
+        else:
+
+            tracker_detections = detections
+
+        # ----------------------------------------------------
+        # 4. CONVERT TO ULTRALYTICS BOXES
+        # ----------------------------------------------------
+
+        boxes = detections_to_boxes(
+            tracker_detections,
+            frame.shape,
+        )
+
+        # ----------------------------------------------------
+        # 5. BYTE TRACK
+        # ----------------------------------------------------
+
+        tracks = tracker.update(
+            boxes,
+            frame,
+        )
+
+        if tracks is None:
+            tracks = np.empty(
+                (0, 8),
+                dtype=np.float32,
+            )
+
+        if len(tracks) > 0:
+
+            total_tracked_detections += len(
+                tracks
+            )
+
+            for track in tracks:
+
+                if len(track) >= 5:
+
+                    track_id = int(
+                        track[4]
+                    )
+
+                    unique_ids.add(
+                        track_id
+                    )
+
+        # ----------------------------------------------------
+        # 6. DRAW
+        # ----------------------------------------------------
+
+        annotated_frame = frame.copy()
+
+        # When GMC is enabled, ByteTrack coordinates are in
+        # the previous/reference coordinate system.
+        #
+        # To draw them on the current frame, transform using
+        # the original camera transform:
+        #
+        # previous -> current
+
+        if gmc_enabled:
+
+            draw_tracks_frame = annotated_frame.copy()
+
+            if tracks is not None:
+
+                for track in tracks:
+
+                    if len(track) < 5:
+                        continue
+
+                    bbox = transform_bbox(
+                        track[:4],
+                        camera_transform,
+                        frame_width,
+                        frame_height,
+                    )
+
+                    if bbox is None:
+                        continue
+
+                    x1, y1, x2, y2 = bbox
+
+                    track_id = int(
+                        track[4]
+                    )
+
+                    confidence = (
+                        float(track[5])
+                        if len(track) > 5
+                        else 0.0
+                    )
+
+                    cv2.rectangle(
+                        draw_tracks_frame,
+                        (
+                            int(x1),
+                            int(y1),
+                        ),
+                        (
+                            int(x2),
+                            int(y2),
+                        ),
+                        (255, 255, 255),
+                        2,
+                    )
+
+                    cv2.putText(
+                        draw_tracks_frame,
+                        (
+                            f"Person ID: "
+                            f"{track_id} "
+                            f"{confidence:.2f}"
+                        ),
+                        (
+                            int(x1),
+                            max(
+                                20,
+                                int(y1) - 8,
+                            ),
+                        ),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+            annotated_frame = (
+                draw_tracks_frame
+            )
+
+        else:
+
+            annotated_frame = draw_tracks(
+                annotated_frame,
+                tracks,
+            )
+
+        # ----------------------------------------------------
+        # 7. STATUS TEXT
+        # ----------------------------------------------------
+
+        current_fps = (
+            1.0
+            / max(
                 time.perf_counter()
-                - frame_start
-            ) * 1000.0
+                - frame_start,
+                1e-9,
+            )
+        )
 
-            frame_times.append(
-                frame_ms
+        cv2.putText(
+            annotated_frame,
+            f"Frame: {frame_count}",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            annotated_frame,
+            f"Persons: {len(detections)}",
+            (20, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            annotated_frame,
+            f"Tracks: {len(tracks)}",
+            (20, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            annotated_frame,
+            f"FPS: {current_fps:.2f}",
+            (20, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        writer.write(
+            annotated_frame
+        )
+
+        frame_time_ms = (
+            time.perf_counter()
+            - frame_start
+        ) * 1000.0
+
+        frame_times.append(
+            frame_time_ms
+        )
+
+        # ----------------------------------------------------
+        # PROGRESS
+        # ----------------------------------------------------
+
+        if (
+            frame_count == 1
+            or frame_count % 100 == 0
+        ):
+
+            print(
+                f"Frame {frame_count:4d} | "
+                f"Detections: "
+                f"{len(detections):3d} | "
+                f"Tracks: "
+                f"{len(tracks):3d} | "
+                f"FPS: "
+                f"{current_fps:6.2f}"
             )
 
-            # ------------------------------------------------
-            # PROGRESS
-            # ------------------------------------------------
-
-            if frame_count % 100 == 0:
-
-                elapsed = (
-                    time.perf_counter()
-                    - total_start
-                )
-
-                processing_fps = (
-                    frame_count / elapsed
-                    if elapsed > 0
-                    else 0.0
-                )
-
-                print(
-                    f"Frame {frame_count:4d} | "
-                    f"Detections: "
-                    f"{total_detections:4d} | "
-                    f"Tracks: "
-                    f"{total_tracked:4d} | "
-                    f"FPS: "
-                    f"{processing_fps:.2f}"
-                )
-
-    finally:
-
-        cap.release()
-        writer.release()
-
     # --------------------------------------------------------
-    # FINAL METRICS
+    # CLEANUP
     # --------------------------------------------------------
+
+    cap.release()
+    writer.release()
 
     total_time = (
         time.perf_counter()
-        - total_start
+        - start_total
     )
 
     processing_fps = (
@@ -1155,232 +972,141 @@ def main():
         else 0.0
     )
 
-    average_inference = (
-        float(
-            np.mean(
-                inference_times
-            )
-        )
+    average_inference_ms = (
+        float(np.mean(inference_times))
         if inference_times
         else 0.0
     )
 
-    average_frame_time = (
-        float(
-            np.mean(
-                frame_times
-            )
-        )
+    average_frame_ms = (
+        float(np.mean(frame_times))
         if frame_times
         else 0.0
     )
 
-    average_track_length = (
-        total_tracked
-        / len(unique_ids)
-        if unique_ids
-        else 0.0
-    )
-
-    shortest_track = (
-        min(
-            track_lengths.values()
-        )
-        if track_lengths
-        else 0
-    )
-
-    longest_track = (
-        max(
-            track_lengths.values()
-        )
-        if track_lengths
-        else 0
-    )
-
     average_gmc_inliers = (
-        float(
-            np.mean(gmc_inliers)
-        )
+        float(np.mean(gmc_inliers))
         if gmc_inliers
         else 0.0
     )
 
     # --------------------------------------------------------
-    # PRINT RESULTS
+    # METRICS
+    # --------------------------------------------------------
+
+    metrics = {
+        "frames": frame_count,
+        "person_detections": total_detections,
+        "tracked_detections": total_tracked_detections,
+        "unique_ids": len(unique_ids),
+        "average_detections_per_frame": (
+            total_detections / frame_count
+            if frame_count > 0
+            else 0.0
+        ),
+        "average_tracks_per_frame": (
+            total_tracked_detections / frame_count
+            if frame_count > 0
+            else 0.0
+        ),
+        "average_inference_ms": average_inference_ms,
+        "average_frame_time_ms": average_frame_ms,
+        "processing_fps": processing_fps,
+        "gmc_enabled": gmc_enabled,
+        "gmc_valid_frames": gmc_valid_frames,
+        "gmc_invalid_frames": gmc_invalid_frames,
+        "average_gmc_inliers": average_gmc_inliers,
+        "output_video": str(output_video),
+    }
+
+    with open(
+        metrics_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        file.write(
+            "# Final INT8 Person Tracking Metrics\n\n"
+        )
+
+        for key, value in metrics.items():
+
+            file.write(
+                f"- **{key}:** {value}\n"
+            )
+
+    # --------------------------------------------------------
+    # FINAL SUMMARY
     # --------------------------------------------------------
 
     print()
-
     print("=" * 70)
-    print("FINAL PIPELINE RESULTS")
+    print("FINAL PIPELINE COMPLETE")
     print("=" * 70)
 
     print(
-        f"Frames processed:       "
-        f"{frame_count}"
+        f"Frames: {frame_count}"
     )
 
     print(
-        f"Person detections:      "
+        f"Person detections: "
         f"{total_detections}"
     )
 
     print(
-        f"Tracked detections:     "
-        f"{total_tracked}"
+        f"Tracked detections: "
+        f"{total_tracked_detections}"
     )
 
     print(
-        f"Unique IDs:             "
+        f"Unique IDs: "
         f"{len(unique_ids)}"
     )
 
     print(
-        f"Average persons/frame:  "
-        f"{total_detections / frame_count:.3f}"
-        if frame_count
-        else
-        "Average persons/frame: 0.000"
+        f"Average inference: "
+        f"{average_inference_ms:.2f} ms"
     )
 
     print(
-        f"Average inference:      "
-        f"{average_inference:.2f} ms"
+        f"Average frame time: "
+        f"{average_frame_ms:.2f} ms"
     )
 
     print(
-        f"Average frame time:     "
-        f"{average_frame_time:.2f} ms"
-    )
-
-    print(
-        f"Processing FPS:         "
+        f"Processing FPS: "
         f"{processing_fps:.2f}"
-    )
-
-    print(
-        f"Average track length:   "
-        f"{average_track_length:.2f} frames"
-    )
-
-    print(
-        f"Shortest track:         "
-        f"{shortest_track}"
-    )
-
-    print(
-        f"Longest track:          "
-        f"{longest_track}"
     )
 
     if gmc_enabled:
 
         print(
-            f"GMC valid frames:      "
+            f"GMC valid frames: "
             f"{gmc_valid_frames}"
         )
 
         print(
-            f"GMC invalid frames:    "
+            f"GMC invalid frames: "
             f"{gmc_invalid_frames}"
         )
 
         print(
-            f"Average GMC inliers:    "
+            f"Average GMC inliers: "
             f"{average_gmc_inliers:.2f}"
         )
 
+    print()
     print(
-        f"Output video:           "
+        f"Output video: "
         f"{output_video}"
     )
 
     print(
-        f"Metrics:                "
+        f"Metrics: "
         f"{metrics_path}"
     )
 
     print("=" * 70)
-
-    # --------------------------------------------------------
-    # REPORT
-    # --------------------------------------------------------
-
-    report = f"""# Final Person Tracking Pipeline
-
-## Configuration
-
-- Input video: `{source_path}`
-- Detector: OpenVINO INT8
-- Model: `{model_path}`
-- Tracker: `{config['tracker']['type']}`
-- GMC: `{"enabled" if gmc_enabled else "disabled"}`
-
-## Architecture
-
-The final pipeline uses the following processing flow:
-
-1. Read the original truck-camera frame.
-2. Estimate camera motion using ORB.
-3. Run the OpenVINO INT8 person detector on the original frame.
-4. Transform detection bounding boxes into the GMC reference coordinate system.
-5. Pass transformed person detections to ByteTrack.
-6. Transform tracked boxes back to the original frame.
-7. Draw tracking IDs on the original frame.
-8. Save the final annotated video.
-
-The video frame itself is not warped before detection.
-
-## Results
-
-| Metric | Result |
-|---|---:|
-| Frames processed | {frame_count} |
-| Person detections | {total_detections} |
-| Tracked detections | {total_tracked} |
-| Unique track IDs | {len(unique_ids)} |
-| Average persons/frame | {(total_detections / frame_count) if frame_count else 0:.3f} |
-| Average inference | {average_inference:.2f} ms |
-| Average frame time | {average_frame_time:.2f} ms |
-| Processing FPS | {processing_fps:.2f} |
-| Average track length | {average_track_length:.2f} frames |
-| Shortest track | {shortest_track} frames |
-| Longest track | {longest_track} frames |
-
-## GMC
-
-- Valid GMC frames: {gmc_valid_frames}
-- Invalid GMC frames: {gmc_invalid_frames}
-- Average GMC inliers: {average_gmc_inliers:.2f}
-
-## Output
-
-`{output_video}`
-
-## Purpose
-
-This pipeline combines:
-
-- OpenVINO INT8 person detection
-- ByteTrack multi-object tracking
-- ORB-based global camera-motion estimation
-- GMC-aware detection coordinate transformation
-- Tracking visualization
-- Performance metrics
-
-The detector operates on the original frame to avoid image degradation caused by repeated cumulative warping.
-"""
-
-    metrics_path.write_text(
-        report,
-        encoding="utf-8",
-    )
-
-    print()
-    print(
-        "Final pipeline completed successfully."
-    )
 
 
 if __name__ == "__main__":
